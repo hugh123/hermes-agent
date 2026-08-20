@@ -11766,26 +11766,19 @@ def _desktop_attachment_dir(session: dict) -> Path:
 
 
 def _sanitize_attachment_name(name: str) -> str:
-    import re as _re
+    """Use the shared gateway filename policy for every attachment surface."""
 
-    candidate = Path(str(name or "").strip()).name
-    candidate = _re.sub(r"[\x00-\x1f]+", "_", candidate)
-    candidate = candidate.strip().strip(".")
-    return candidate or "attachment"
+    from gateway.session_attachments import sanitize_attachment_name
+
+    return sanitize_attachment_name(name)
 
 
 def _unique_attachment_path(root: Path, filename: str) -> Path:
-    candidate = root / filename
-    if not candidate.exists():
-        return candidate
-    stem = Path(filename).stem or "attachment"
-    suffix = Path(filename).suffix
-    counter = 2
-    while True:
-        next_candidate = root / f"{stem}-{counter}{suffix}"
-        if not next_candidate.exists():
-            return next_candidate
-        counter += 1
+    """Use the shared non-overwriting path allocator for TUI and HTTP uploads."""
+
+    from gateway.session_attachments import unique_attachment_path
+
+    return unique_attachment_path(root, filename)
 
 
 def _resolve_gateway_attachment_path(raw: str) -> Path | None:

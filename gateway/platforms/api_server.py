@@ -12,6 +12,7 @@ Exposes an HTTP server with endpoints:
 - POST /api/sessions               — create an empty Hermes session
 - GET/PATCH/DELETE /api/sessions/{session_id} — read/update/delete a session
 - GET  /api/sessions/{session_id}/messages — read session message history
+- POST /api/sessions/{session_id}/attachments — stage a file for the session's agent
 - POST /api/sessions/{session_id}/fork — branch a session using SessionDB lineage
 - POST /api/sessions/{session_id}/chat[/stream] — chat with a persisted session
 - POST /v1/runs                    — start a run, returns run_id immediately (202)
@@ -85,6 +86,7 @@ except ImportError:
     web = None  # type: ignore[assignment]
 
 from gateway.config import Platform, PlatformConfig
+from gateway import session_attachments
 from gateway.platforms.base import (
     MEDIA_TAG_CLEANUP_RE,
     BasePlatformAdapter,
@@ -2079,6 +2081,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("PATCH", "/api/sessions/{session_id}", self._handle_patch_session),
             ("DELETE", "/api/sessions/{session_id}", self._handle_delete_session),
             ("GET", "/api/sessions/{session_id}/messages", self._handle_session_messages),
+            ("POST", "/api/sessions/{session_id}/attachments", self._handle_session_attachment_upload),
             ("POST", "/api/sessions/{session_id}/fork", self._handle_fork_session),
             ("POST", "/api/sessions/{session_id}/chat", self._handle_session_chat),
             ("POST", "/api/sessions/{session_id}/chat/stream", self._handle_session_chat_stream),
@@ -3191,6 +3194,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "model_options": True,
                 "session_chat": True,
                 "session_chat_streaming": True,
+                "session_attachment_upload": True,
                 "session_fork": True,
                 "session_model_lock": True,
                 "admin_config_rw": False,
@@ -3224,10 +3228,20 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_update": {"method": "PATCH", "path": "/api/sessions/{session_id}"},
                 "session_delete": {"method": "DELETE", "path": "/api/sessions/{session_id}"},
                 "session_messages": {"method": "GET", "path": "/api/sessions/{session_id}/messages"},
+                "session_attachment_upload": {
+                    "method": "POST",
+                    "path": "/api/sessions/{session_id}/attachments",
+                },
                 "session_fork": {"method": "POST", "path": "/api/sessions/{session_id}/fork"},
                 "session_chat": {"method": "POST", "path": "/api/sessions/{session_id}/chat"},
                 "session_chat_stream": {"method": "POST", "path": "/api/sessions/{session_id}/chat/stream"},
                 "session_model_lock": {"method": "POST", "path": "/api/sessions/{session_id}/model"},
+            },
+            "attachments": {
+                "transport": "multipart/form-data",
+                "form_field": "file",
+                "message_reference": "path",
+                "max_file_bytes": session_attachments.MAX_SESSION_ATTACHMENT_BYTES,
             },
         })
 
@@ -3681,6 +3695,118 @@ class APIServerAdapter(BasePlatformAdapter):
                 "returned": len(messages),
             },
         })
+
+    async def _handle_session_attachment_upload(self, request: "web.Request") -> "web.Response":
+        """Stage one multipart file and return the path visible to the session agent.
+
+        This endpoint deliberately does not alter the chat request schema.  A
+        client uploads the file first, then includes the returned ``path`` in
+        the ordinary text sent to ``/chat`` or ``/chat/stream``.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        session_id = request.match_info["session_id"]
+        _, err = await self._get_existing_session_or_404(session_id)
+        if err:
+            return err
+
+        if request.content_type.lower() != "multipart/form-data":
+            return web.json_response(
+                _openai_error(
+                    "Content-Type must be multipart/form-data",
+                    code="unsupported_media_type",
+                ),
+                status=415,
+            )
+
+        try:
+            reader = await request.multipart()
+            file_part = None
+            while True:
+                part = await reader.next()
+                if part is None:
+                    break
+                if part.name == "file" and part.filename:
+                    file_part = part
+                    break
+            if file_part is None:
+                return web.json_response(
+                    _openai_error(
+                        "Multipart form field 'file' is required",
+                        code="missing_file",
+                    ),
+                    status=400,
+                )
+
+            target = session_attachments.allocate_session_attachment(
+                session_id,
+                file_part.filename,
+                file_part.headers.get("Content-Type"),
+            )
+            with session_attachments.SessionAttachmentWriter(target) as writer:
+                while True:
+                    chunk = await file_part.read_chunk(
+                        size=session_attachments.UPLOAD_CHUNK_BYTES
+                    )
+                    if not chunk:
+                        break
+                    writer.write(chunk)
+                stored = writer.commit()
+        except session_attachments.AttachmentTooLargeError:
+            return web.json_response(
+                _openai_error(
+                    (
+                        "Attachment exceeds the maximum size of "
+                        f"{session_attachments.MAX_SESSION_ATTACHMENT_BYTES} bytes"
+                    ),
+                    code="attachment_too_large",
+                ),
+                status=413,
+            )
+        except session_attachments.EmptyAttachmentError:
+            return web.json_response(
+                _openai_error("Attachment file is empty", code="empty_attachment"),
+                status=400,
+            )
+        except (ValueError, web.HTTPBadRequest):
+            return web.json_response(
+                _openai_error("Invalid multipart request", code="invalid_multipart"),
+                status=400,
+            )
+        except OSError:
+            logger.exception("Failed to store attachment for session %s", session_id)
+            return web.json_response(
+                _openai_error(
+                    "Failed to store attachment",
+                    code="attachment_upload_failed",
+                ),
+                status=500,
+            )
+        except Exception:
+            logger.exception("Unexpected attachment upload failure for session %s", session_id)
+            return web.json_response(
+                _openai_error(
+                    "Failed to store attachment",
+                    code="attachment_upload_failed",
+                ),
+                status=500,
+            )
+
+        return web.json_response(
+            {
+                "object": "hermes.session.attachment",
+                "id": stored.target.attachment_id,
+                "session_id": stored.target.session_id,
+                "filename": stored.target.filename,
+                "content_type": stored.target.content_type,
+                "size": stored.size,
+                "sha256": stored.sha256,
+                "path": stored.target.agent_path,
+            },
+            status=201,
+        )
 
     async def _handle_fork_session(self, request: "web.Request") -> "web.Response":
         """POST /api/sessions/{session_id}/fork — branch via current SessionDB primitives."""

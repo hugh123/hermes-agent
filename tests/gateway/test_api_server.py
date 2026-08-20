@@ -312,6 +312,10 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/v1/capabilities", adapter._handle_capabilities)
     app.router.add_get("/v1/skills", adapter._handle_skills)
     app.router.add_get("/v1/toolsets", adapter._handle_toolsets)
+    app.router.add_post(
+        "/api/sessions/{session_id}/attachments",
+        adapter._handle_session_attachment_upload,
+    )
     app.router.add_post("/api/sessions/{session_id}/chat", adapter._handle_session_chat)
     app.router.add_post("/api/sessions/{session_id}/chat/stream", adapter._handle_session_chat_stream)
     app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
@@ -871,9 +875,20 @@ class TestCapabilitiesEndpoint:
             assert data["features"]["run_status"] is True
             assert data["features"]["run_events_sse"] is True
             assert data["features"]["model_options"] is True
+            assert data["features"]["session_attachment_upload"] is True
             assert data["features"]["session_continuity_header"] == "X-Hermes-Session-Id"
             assert data["endpoints"]["run_status"]["path"] == "/v1/runs/{run_id}"
             assert data["endpoints"]["model_options"] == {"method": "GET", "path": "/api/model/options"}
+            assert data["endpoints"]["session_attachment_upload"] == {
+                "method": "POST",
+                "path": "/api/sessions/{session_id}/attachments",
+            }
+            assert data["attachments"] == {
+                "transport": "multipart/form-data",
+                "form_field": "file",
+                "message_reference": "path",
+                "max_file_bytes": 50 * 1024 * 1024,
+            }
             assert data["endpoints"]["skills"] == {"method": "GET", "path": "/v1/skills"}
             assert data["endpoints"]["toolsets"] == {"method": "GET", "path": "/v1/toolsets"}
 
