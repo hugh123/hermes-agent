@@ -2180,6 +2180,29 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return raw, None
 
+    def _parse_user_id_header(
+        self, request: "web.Request"
+    ) -> tuple[Optional[str], Optional["web.Response"]]:
+        """Extract and validate the X-Hermes-User-Id header.
+
+        The user id scopes the Honcho user peer (who this memory is about),
+        orthogonal to X-Hermes-Session-Key (which scopes the conversation
+        bucket). Optional: absent header -> peerName fallback."""
+        raw = request.headers.get("X-Hermes-User-Id", "").strip()
+        if not raw:
+            return None, None
+        if re.search(r"[\r\n\x00]", raw):
+            return None, web.json_response(
+                {"error": {"message": "Invalid user id", "type": "invalid_request_error"}},
+                status=400,
+            )
+        if len(raw) > self._MAX_SESSION_HEADER_LEN:
+            return None, web.json_response(
+                {"error": {"message": "User id too long", "type": "invalid_request_error"}},
+                status=400,
+            )
+        return raw, None
+
     # ------------------------------------------------------------------
     # Session DB helper
     # ------------------------------------------------------------------
@@ -2622,6 +2645,7 @@ class APIServerAdapter(BasePlatformAdapter):
         requested_model: Optional[str],
         requested_provider: Optional[str],
         route: Optional[Dict[str, Any]],
+        user_id: Optional[str] = None,
     ) -> Optional[str]:
         """Return a 400-worthy conflict string for ambiguous route/provider mixes."""
         request_provider = _clean_request_string(requested_provider)
@@ -2664,6 +2688,7 @@ class APIServerAdapter(BasePlatformAdapter):
         route: Optional[Dict[str, Any]] = None,
         session_model: Optional[str] = None,
         confirmed_runtime_lock: bool = False,
+        user_id: Optional[str] = None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -2975,6 +3000,8 @@ class APIServerAdapter(BasePlatformAdapter):
             "reasoning_config": reasoning_config,
             "gateway_session_key": gateway_session_key,
         }
+        if user_id:
+            agent_kwargs["user_id"] = user_id
         if request_service_tier is not _REQUEST_OPTION_MISSING:
             agent_kwargs["service_tier"] = request_service_tier
 
@@ -3861,6 +3888,9 @@ class APIServerAdapter(BasePlatformAdapter):
         gateway_session_key, key_err = self._parse_session_key_header(request)
         if key_err is not None:
             return key_err
+        user_id, uid_err = self._parse_user_id_header(request)
+        if uid_err is not None:
+            return uid_err
         session_id = request.match_info["session_id"]
         session, err = await self._get_existing_session_or_404(session_id)
         if err:
@@ -3919,6 +3949,7 @@ class APIServerAdapter(BasePlatformAdapter):
             selection_error = self._request_route_conflict_error(
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
+                user_id=user_id,
                 requested_model=agent_overrides.get("requested_model"),
                 requested_provider=agent_overrides.get("requested_provider"),
                 route=route,
@@ -3932,6 +3963,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ephemeral_system_prompt=system_prompt,
             session_id=session_id,
             gateway_session_key=gateway_session_key,
+            user_id=user_id,
             route=route,
             session_model=session_model,
             requested_runtime=runtime_request.get("requested") or {},
@@ -3978,6 +4010,9 @@ class APIServerAdapter(BasePlatformAdapter):
         gateway_session_key, key_err = self._parse_session_key_header(request)
         if key_err is not None:
             return key_err
+        user_id, uid_err = self._parse_user_id_header(request)
+        if uid_err is not None:
+            return uid_err
         session_id = request.match_info["session_id"]
         session, err = await self._get_existing_session_or_404(session_id)
         if err:
@@ -4029,6 +4064,7 @@ class APIServerAdapter(BasePlatformAdapter):
             selection_error = self._request_route_conflict_error(
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
+                user_id=user_id,
                 requested_model=agent_overrides.get("requested_model"),
                 requested_provider=agent_overrides.get("requested_provider"),
                 route=route,
@@ -4105,6 +4141,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     tool_progress_callback=_tool_progress,
                     active_run_id=run_id,
                     gateway_session_key=gateway_session_key,
+                    user_id=user_id,
                     route=route,
                     session_model=session_model,
                     requested_runtime=runtime_request.get("requested") or {},
@@ -4361,6 +4398,9 @@ class APIServerAdapter(BasePlatformAdapter):
         gateway_session_key, key_err = self._parse_session_key_header(request)
         if key_err is not None:
             return key_err
+        user_id, uid_err = self._parse_user_id_header(request)
+        if uid_err is not None:
+            return uid_err
 
         # Allow caller to continue an existing session by passing X-Hermes-Session-Id.
         # When provided, history is loaded from state.db instead of from the request body.
@@ -4437,6 +4477,7 @@ class APIServerAdapter(BasePlatformAdapter):
         selection_error = self._request_route_conflict_error(
             session_id=session_id,
             gateway_session_key=gateway_session_key,
+            user_id=user_id,
             requested_model=agent_overrides.get("requested_model"),
             requested_provider=agent_overrides.get("requested_provider"),
             route=route,
@@ -4527,6 +4568,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_complete_callback=_on_tool_complete,
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
+                user_id=user_id,
                 **agent_overrides,
                 route=route,
             ))
@@ -4548,6 +4590,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
+                user_id=user_id,
                 **agent_overrides,
                 route=route,
             )
@@ -5469,6 +5512,9 @@ class APIServerAdapter(BasePlatformAdapter):
         gateway_session_key, key_err = self._parse_session_key_header(request)
         if key_err is not None:
             return key_err
+        user_id, uid_err = self._parse_user_id_header(request)
+        if uid_err is not None:
+            return uid_err
 
         # Parse request body
         try:
@@ -5579,6 +5625,7 @@ class APIServerAdapter(BasePlatformAdapter):
         selection_error = self._request_route_conflict_error(
             session_id=session_id,
             gateway_session_key=gateway_session_key,
+            user_id=user_id,
             requested_model=agent_overrides.get("requested_model"),
             requested_provider=agent_overrides.get("requested_provider"),
             route=route,
@@ -5638,6 +5685,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_complete_callback=_on_tool_complete,
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
+                user_id=user_id,
                 **agent_overrides,
                 route=route,
             ))
@@ -5673,6 +5721,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=instructions,
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
+                user_id=user_id,
                 **agent_overrides,
                 route=route,
             )
@@ -6416,6 +6465,7 @@ class APIServerAdapter(BasePlatformAdapter):
         chat_id: str = "",
         session_key: str = "",
         session_id: str = "",
+        user_id: str = "",
     ) -> list:
         """Bind session contextvars for an API-server agent run.
 
@@ -6439,6 +6489,7 @@ class APIServerAdapter(BasePlatformAdapter):
             chat_id=chat_id,
             session_key=session_key,
             session_id=session_id,
+            user_id=user_id,
             async_delivery=False,
             cron_session="",
         )
@@ -6464,6 +6515,7 @@ class APIServerAdapter(BasePlatformAdapter):
         requested_runtime: Optional[Dict[str, Any]] = None,
         route_source: str = "global",
         confirmed_runtime_lock: bool = False,
+        user_id: Optional[str] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -6508,6 +6560,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     chat_id=session_id or "",
                     session_key=gateway_session_key or session_id or "",
                     session_id=session_id or "",
+                    user_id=user_id or "",
                 )
                 agent = None
                 try:
@@ -6525,6 +6578,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         route=route,
                         session_model=session_model,
                         confirmed_runtime_lock=confirmed_runtime_lock,
+                        user_id=user_id,
                     )
                     if agent_ref is not None:
                         agent_ref[0] = agent
@@ -6811,6 +6865,9 @@ class APIServerAdapter(BasePlatformAdapter):
         gateway_session_key, key_err = self._parse_session_key_header(request)
         if key_err is not None:
             return key_err
+        user_id, uid_err = self._parse_user_id_header(request)
+        if uid_err is not None:
+            return uid_err
 
         # Enforce concurrency limit (shared across all agent-serving
         # endpoints; configurable via gateway.api_server.max_concurrent_runs).
@@ -6884,6 +6941,7 @@ class APIServerAdapter(BasePlatformAdapter):
         selection_error = self._request_route_conflict_error(
             session_id=session_id,
             gateway_session_key=gateway_session_key,
+            user_id=user_id,
             requested_model=agent_overrides.get("requested_model"),
             requested_provider=agent_overrides.get("requested_provider"),
             route=route,
@@ -6964,6 +7022,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         stream_delta_callback=_text_cb,
                         tool_progress_callback=event_cb,
                         gateway_session_key=gateway_session_key,
+                        user_id=user_id,
                         requested_model=agent_overrides.get("requested_model"),
                         requested_provider=agent_overrides.get("requested_provider"),
                         model_options=agent_overrides.get("model_options"),
