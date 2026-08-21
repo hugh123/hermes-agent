@@ -1824,6 +1824,7 @@ def init_agent(
     # So the built-in store is created unless memory is globally disabled, while
     # the external-provider block below stays gated on skip_memory.
     _memory_toolset_requested = "memory" in (agent.enabled_toolsets or [])
+    mem_config = None
     if not skip_memory or _memory_toolset_requested:
         try:
             from tools.memory_tool import (
