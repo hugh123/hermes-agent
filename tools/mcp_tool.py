@@ -504,6 +504,37 @@ def mcp_field(obj, snake: str, camel: str, default=None):
     return default if value is _MISSING else value
 
 
+def _build_call_tool_meta(
+    server: "MCPServerTask", raw_session_data: Optional[str] = None
+) -> Optional[dict]:
+    """Build opt-in request metadata for an MCP ``tools/call`` request.
+
+    ``X-Hermes-Data`` is an opaque, request-scoped value.  The API server
+    stores it in a ContextVar so concurrent requests cannot overwrite one
+    another.  MCP servers must explicitly opt in with
+    ``forward_session_data: true``.  Decode JSON when possible for the usual
+    JSON-object case; if the caller sends another value, preserve it as a
+    string instead of rejecting or dropping the request.
+    """
+    if not _parse_boolish(
+        server._config.get("forward_session_data", False), default=False
+    ):
+        return None
+
+    if raw_session_data is None:
+        from gateway.session_context import get_session_env
+
+        raw_session_data = get_session_env("HERMES_SESSION_DATA", "")
+    raw = raw_session_data
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        data = raw
+    return {"com.hermes/data": data}
+
+
 def _check_message_handler_support() -> bool:
     """Check if ClientSession accepts ``message_handler`` kwarg.
 
@@ -5818,6 +5849,14 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                     )
                 return tool_error(f"MCP server '{server_name}' is not connected")
 
+        # Capture request-scoped data before moving the call to the dedicated
+        # MCP event-loop thread. ContextVars do not automatically cross
+        # run_coroutine_threadsafe boundaries; passing the snapshot through the
+        # coroutine closure keeps concurrent API requests isolated.
+        from gateway.session_context import get_session_env
+
+        request_session_data = get_session_env("HERMES_SESSION_DATA", "")
+
         async def _call():
             _mark_server_call_started(server)
             async with server._rpc_lock:
@@ -5827,7 +5866,11 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 # it and detect the gateway platform / session for routing.
                 server._pending_call_context = contextvars.copy_context()
                 try:
-                    result = await server.session.call_tool(tool_name, arguments=args)
+                    call_kwargs = {"arguments": args}
+                    meta = _build_call_tool_meta(server, request_session_data)
+                    if meta is not None:
+                        call_kwargs["meta"] = meta
+                    result = await server.session.call_tool(tool_name, **call_kwargs)
                 finally:
                     server._pending_call_context = None
             # The RPC round-trip completed — the session is demonstrably

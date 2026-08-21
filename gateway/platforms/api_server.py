@@ -6516,6 +6516,7 @@ class APIServerAdapter(BasePlatformAdapter):
         session_key: str = "",
         session_id: str = "",
         user_id: str = "",
+        session_data: str = "",
     ) -> list:
         """Bind session contextvars for an API-server agent run.
 
@@ -6540,6 +6541,7 @@ class APIServerAdapter(BasePlatformAdapter):
             session_key=session_key,
             session_id=session_id,
             user_id=user_id,
+            session_data=session_data,
             async_delivery=False,
             cron_session="",
         )
@@ -6612,6 +6614,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     session_key=gateway_session_key or session_id or "",
                     session_id=session_id or "",
                     user_id=user_id or "",
+                    session_data=hermes_data or "",
                 )
                 agent = None
                 try:
@@ -7146,6 +7149,8 @@ class APIServerAdapter(BasePlatformAdapter):
                                 chat_id=session_id or "",
                                 session_key=approval_session_key,
                                 session_id=session_id or "",
+                                user_id=user_id or "",
+                                session_data=hermes_data or "",
                             )
                             register_gateway_notify(approval_session_key, _approval_notify)
                             # /v1/runs runs its own agent lifecycle (no
