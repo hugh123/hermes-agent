@@ -567,6 +567,7 @@ def init_agent(
     platform: str = None,
     user_id: str = None,
     user_id_alt: str = None,
+    hermes_data: str = None,
     user_name: str = None,
     chat_id: str = None,
     chat_name: str = None,
@@ -653,6 +654,7 @@ def init_agent(
     agent.ephemeral_system_prompt = ephemeral_system_prompt
     agent.platform = platform  # "cli", "telegram", "discord", "whatsapp", etc.
     agent._user_id = user_id  # Platform user identifier (gateway sessions)
+    agent._hermes_data = hermes_data  # Opaque X-Hermes-Data passthrough payload
     agent._user_id_alt = user_id_alt  # Optional stable alternate platform identifier
     agent._user_name = user_name
     agent._chat_id = chat_id
@@ -1822,6 +1824,7 @@ def init_agent(
     # So the built-in store is created unless memory is globally disabled, while
     # the external-provider block below stays gated on skip_memory.
     _memory_toolset_requested = "memory" in (agent.enabled_toolsets or [])
+    mem_config = None
     if not skip_memory or _memory_toolset_requested:
         try:
             from tools.memory_tool import (

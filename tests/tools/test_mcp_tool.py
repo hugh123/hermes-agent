@@ -576,6 +576,41 @@ class TestToolHandler:
         finally:
             _servers.pop("test_srv", None)
 
+    def test_forwards_request_data_to_opted_in_mcp_server(self):
+        from gateway.session_context import clear_session_vars, set_session_vars
+        from tools.mcp_tool import _make_tool_handler, _servers
+
+        mock_session = MagicMock()
+        mock_session.call_tool = AsyncMock(
+            return_value=_make_call_result("forwarded", is_error=False)
+        )
+        server = _make_mock_server("test_srv", session=mock_session)
+        server._config = {"forward_session_data": True}
+        _servers["test_srv"] = server
+        tokens = set_session_vars(
+            platform="api_server",
+            session_data='{"userId":"10018037","corpId":"corp-1"}',
+        )
+
+        try:
+            handler = _make_tool_handler("test_srv", "greet", 120)
+            with self._patch_mcp_loop():
+                result = json.loads(handler({"name": "world"}))
+            assert result["result"] == "forwarded"
+            mock_session.call_tool.assert_called_once_with(
+                "greet",
+                arguments={"name": "world"},
+                meta={
+                    "com.hermes/data": {
+                        "userId": "10018037",
+                        "corpId": "corp-1",
+                    }
+                },
+            )
+        finally:
+            clear_session_vars(tokens)
+            _servers.pop("test_srv", None)
+
 
     def test_recycled_stdio_server_reconnects_lazily_on_tool_call(self):
         from tools.mcp_tool import _make_tool_handler, _servers
