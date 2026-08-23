@@ -166,10 +166,15 @@ def record_gateway_restart(**kwargs: Any) -> None:
         logger.debug("Could not record gateway restart result: %s", exc)
 
 
-def finalize_update_receipt(outcome: str, fleet: list | None = None) -> Optional[Path]:
+def finalize_update_receipt(
+    outcome: str, fleet: list | None = None, stop_reason: str = ""
+) -> Optional[Path]:
     """Finalize + persist the receipt. Returns the written path or None.
 
-    ``outcome`` is one of ``success`` / ``partial`` / ``failed``.
+    ``outcome`` is one of ``success`` / ``partial`` / ``failed`` /
+    ``refused``. Exactly-once by construction: the module singleton is
+    popped first, so a second call (e.g. the command-boundary safety net
+    after an inner path already finalized) is a no-op returning None.
     """
     global _current
     receipt = _current
@@ -178,6 +183,8 @@ def finalize_update_receipt(outcome: str, fleet: list | None = None) -> Optional
         return None
     try:
         receipt.finalize(outcome)
+        if stop_reason:
+            receipt.data["stop_reason"] = stop_reason
         if fleet is not None:
             receipt.data["fleet"] = fleet
         directory = _receipt_dir()
@@ -200,6 +207,42 @@ def finalize_update_receipt(outcome: str, fleet: list | None = None) -> Optional
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("Could not write update receipt: %s", exc)
         return None
+
+
+def finalize_pending_update_receipt(
+    exit_code: Optional[int] = None, stop_reason: str = ""
+) -> Optional[Path]:
+    """Command-boundary safety net: persist a still-open receipt, if any.
+
+    ``hermes update`` has many early-termination paths (Windows
+    concurrent-instance preflight, venv-holder refusal, head-pinned no-op,
+    fetch failure — all ``sys.exit``) that predate the inner finalize
+    call sites. Any receipt still open when the update COMMAND unwinds is
+    finalized here so every post-begin run leaves a record — the
+    refused/failed runs are exactly the ones a receipt matters most for
+    (review on #91283). No-op when no receipt is open (the inner paths
+    already finalized — exactly-once via the popped singleton) or when
+    recording was never started. Never raises.
+
+    Outcome mapping: exit 0/None → ``success`` (a path that completed
+    without an explicit inner finalize), exit 2 → ``refused`` (the
+    updater's preflight-refusal convention), anything else → ``failed``.
+    """
+    if _current is None:
+        return None
+    if exit_code in (0, None):
+        outcome = "success"
+    elif exit_code == 2:
+        outcome = "refused"
+    else:
+        outcome = "failed"
+    try:
+        receipt = _current
+        if receipt is not None and exit_code is not None:
+            receipt.data["exit_code"] = int(exit_code)
+    except Exception:
+        pass
+    return finalize_update_receipt(outcome, stop_reason=stop_reason)
 
 
 def _prune_old_receipts(directory: Path) -> None:
@@ -276,6 +319,41 @@ def collect_fleet_versions() -> list[dict[str, Any]]:
                     homes.append((entry.name, entry))
 
         for profile, home in homes:
+            # Prefer the gateway-owned control socket (#92091): a live
+            # `identify` answer is authoritative — no PID-reuse or stale-file
+            # heuristics. Fall back to gateway_state.json for gateways that
+            # predate the socket or whose socket didn't bind.
+            identity = None
+            try:
+                from gateway.control_socket import identify_gateway
+
+                identity = identify_gateway(home)
+            except Exception:
+                identity = None
+            if identity:
+                try:
+                    pid = int(identity.get("pid"))
+                except (TypeError, ValueError):
+                    pid = None
+                if pid is not None:
+                    code_sha = identity.get("code_sha")
+                    if not code_sha or not expected_sha:
+                        state = "unknown"
+                    elif str(code_sha) == str(expected_sha):
+                        state = "current"
+                    else:
+                        state = "stale"
+                    results.append(
+                        {
+                            "profile": profile,
+                            "pid": pid,
+                            "code_sha": str(code_sha) if code_sha else None,
+                            "code_version": identity.get("code_version"),
+                            "state": state,
+                            "source": "socket",
+                        }
+                    )
+                    continue
             status_path = home / "gateway_state.json"
             record = read_runtime_status(status_path)
             if not record:

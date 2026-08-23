@@ -4001,6 +4001,7 @@ def select_provider_and_model(args=None):
         "kilocode",
         "opencode-zen",
         "opencode-go",
+        "opencode-free",
         "alibaba",
         "huggingface",
         "xiaomi",
@@ -4901,6 +4902,7 @@ _LAZY_COMMAND_EXPORTS = {
         "_print_curator_first_run_notice",
         "_print_curator_recent_run_notice",
         "_print_fts_optimize_available_notice",
+        "_print_parked_branch_kept_notice",
         "_print_parked_branch_skip_warning",
         "_print_stash_cleanup_guidance",
         "_print_update_completion",
@@ -8982,7 +8984,8 @@ def _hermes_exe_shims(scripts_dir: Path) -> list[Path]:
 
 
 def _quarantine_running_hermes_exe(
-    scripts_dir: Path, *, max_attempts: int = 4
+    scripts_dir: Path, *, max_attempts: int = 4,
+    failed_out: list[str] | None = None,
 ) -> list[tuple[Path, Path]]:
     """Pre-empt Windows file lock on the running ``hermes.exe``.
 
@@ -9012,6 +9015,11 @@ def _quarantine_running_hermes_exe(
 
     Returns the list of (original, quarantined) pairs so the caller can roll
     back if the install itself fails before uv writes a replacement.
+
+    ``failed_out``: when provided, the names of shims whose rename failed on
+    every attempt are appended — callers that must not mutate a contended
+    venv (the update dependency sync, #87331) check it and refuse instead of
+    letting the install run into a half-broken state.
     """
     moved: list[tuple[Path, Path]] = []
     if not _is_windows():
@@ -9062,6 +9070,8 @@ def _quarantine_running_hermes_exe(
             "    Close Hermes Desktop, exit other `hermes` REPLs, stop the "
             "gateway, or pause AV scanning, then re-run `hermes update`."
         )
+        if failed_out is not None:
+            failed_out.append(shim.name)
 
     return moved
 
@@ -9150,11 +9160,29 @@ def _restore_quarantined_exes(moved: list[tuple[Path, Path]]) -> None:
             pass
 
 
+class ShimQuarantineError(RuntimeError):
+    """A live ``hermes*.exe`` shim could not be renamed aside (#87331).
+
+    Raised by :func:`_run_quarantined_install` in ``strict_quarantine`` mode
+    BEFORE the install command runs. A shim that cannot even be renamed means
+    another process holds the venv hard enough that the dependency sync would
+    die partway and strand the install half-updated — the update must refuse,
+    not warn-and-continue.
+    """
+
+    def __init__(self, failed_shims: list[str]):
+        self.failed_shims = list(failed_shims)
+        super().__init__(
+            "could not quarantine live shim(s): " + ", ".join(self.failed_shims)
+        )
+
+
 def _run_quarantined_install(
     cmd: list[str],
     *,
     env: dict[str, str] | None = None,
     scripts_dir: Path | None = None,
+    strict_quarantine: bool = False,
 ) -> None:
     """Run an editable install, quarantining the running ``hermes.exe`` first.
 
@@ -9169,11 +9197,24 @@ def _run_quarantined_install(
     :func:`_verify_core_dependencies_installed`, which previously called
     ``_run_install_with_heartbeat`` directly and bypassed quarantine.
 
+    ``strict_quarantine=True`` (the update dependency sync, #87331): a shim
+    whose rename failed every retry means a process is holding the venv
+    without ``FILE_SHARE_DELETE`` — the install WILL hit the same lock on
+    .pyd files and strand the venv between versions. Roll the successful
+    renames back and raise :class:`ShimQuarantineError` WITHOUT running the
+    install. Non-strict callers (post-sync entry-point repair) keep the old
+    warn-and-try behavior: their venv is already mutated, so refusing buys
+    nothing.
+
     Off-Windows (``scripts_dir is None``) this is a thin pass-through.
     """
     moved: list[tuple[Path, Path]] = []
+    failed: list[str] = []
     if scripts_dir is not None:
-        moved = _quarantine_running_hermes_exe(scripts_dir)
+        moved = _quarantine_running_hermes_exe(scripts_dir, failed_out=failed)
+    if strict_quarantine and failed:
+        _restore_quarantined_exes(moved)
+        raise ShimQuarantineError(failed)
     try:
         _run_install_with_heartbeat(cmd, env=env)
     finally:
@@ -9448,8 +9489,14 @@ def _install_python_dependencies_with_optional_fallback(
     scripts_dir = _venv_scripts_dir() if _is_windows() else None
 
     def _install(args: list[str]) -> None:
+        # strict_quarantine: this is the UPDATE dependency sync. A shim that
+        # cannot be renamed aside proves a hard venv hold; running uv anyway
+        # is how installs strand half-updated (#87331). ShimQuarantineError
+        # propagates to the update's sync boundary, which defers via the
+        # update-incomplete marker instead of mutating a contended venv.
         _run_quarantined_install(
-            install_cmd_prefix + args, env=env, scripts_dir=scripts_dir
+            install_cmd_prefix + args, env=env, scripts_dir=scripts_dir,
+            strict_quarantine=True,
         )
 
     try:
@@ -10078,6 +10125,22 @@ def cmd_update(args):
         managed_error("update Hermes Agent")
         return
 
+    # --plan is read-only and deployment-kind aware, so it runs BEFORE the
+    # docker/nix/apt refusal gates: on an image-managed or package-managed
+    # install the plan itself reports "not updatable in place" plus the
+    # right mechanism — strictly more useful than the bare refusal text.
+    if getattr(args, "plan", False):
+        # Read-only plan phase (#91277 Phase 2): inventory every running
+        # Hermes runtime across profiles, its supervisor, and its running
+        # code version — without mutating anything. Safe on a live fleet.
+        from hermes_cli.update_inventory import (
+            collect_runtime_inventory,
+            print_update_plan,
+        )
+
+        print_update_plan(collect_runtime_inventory())
+        return
+
     # Docker users can't ``git pull`` — the image excludes ``.git`` from
     # the build context.  Bail with a friendly explanation pointing at
     # ``docker pull`` BEFORE any of the apply-path / check-path branches
@@ -10129,6 +10192,38 @@ def cmd_update(args):
 
     try:
         _self()._cmd_update_impl(args, gateway_mode=gateway_mode)
+    except SystemExit as _update_exit:
+        # Receipt boundary (#91283 review): the impl has many early
+        # sys.exit paths (concurrent-instance preflight, venv-holder
+        # refusal, head-pinned no-op, fetch failure) that never reach an
+        # inner finalize. Persist any still-open receipt with the real
+        # exit code, then let the exit proceed unchanged. No-op when an
+        # inner path already finalized (exactly-once by construction).
+        try:
+            from hermes_cli.update_receipt import finalize_pending_update_receipt
+
+            _code = _update_exit.code if isinstance(_update_exit.code, int) else 1
+            finalize_pending_update_receipt(_code, f"sys.exit({_code})")
+        except Exception:
+            pass
+        raise
+    except BaseException as _update_exc:
+        try:
+            from hermes_cli.update_receipt import finalize_pending_update_receipt
+
+            finalize_pending_update_receipt(
+                1, f"{type(_update_exc).__name__}: {_update_exc}"
+            )
+        except Exception:
+            pass
+        raise
+    else:
+        try:
+            from hermes_cli.update_receipt import finalize_pending_update_receipt
+
+            finalize_pending_update_receipt(0, "completed at command boundary")
+        except Exception:
+            pass
     finally:
         _update_lock.release()
         _finalize_update_output(_update_io_state)
