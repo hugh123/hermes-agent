@@ -12,6 +12,7 @@ import asyncio
 import logging
 import os
 import re
+import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -31,6 +32,10 @@ from tools.mcp_tool import _ENV_VAR_PATTERN, _env_ref_name
 logger = logging.getLogger(__name__)
 
 _ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+# MCP configuration is shared by the CLI, Dashboard and Gateway API surfaces.
+# Keep read-modify-write operations serialized within one Hermes process.
+MCP_CONFIG_MUTATION_LOCK = threading.RLock()
 
 
 _MCP_PRESETS: Dict[str, Dict[str, Any]] = {
@@ -98,23 +103,25 @@ def _save_mcp_server(name: str, server_config: dict) -> bool:
             _warning(issue)
         _warning(f"Server '{name}' was NOT saved due to suspicious configuration.")
         return False
-    config = load_config()
-    config.setdefault("mcp_servers", {})[name] = server_config
-    save_config(config)
+    with MCP_CONFIG_MUTATION_LOCK:
+        config = load_config()
+        config.setdefault("mcp_servers", {})[name] = server_config
+        save_config(config)
     return True
 
 
 def _remove_mcp_server(name: str) -> bool:
     """Remove a server from config.yaml.  Returns True if it existed."""
-    config = load_config()
-    servers = config.get("mcp_servers", {})
-    if name not in servers:
-        return False
-    del servers[name]
-    if not servers:
-        config.pop("mcp_servers", None)
-    save_config(config)
-    return True
+    with MCP_CONFIG_MUTATION_LOCK:
+        config = load_config()
+        servers = config.get("mcp_servers", {})
+        if name not in servers:
+            return False
+        del servers[name]
+        if not servers:
+            config.pop("mcp_servers", None)
+        save_config(config)
+        return True
 
 
 def _replace_mcp_servers(servers: Dict[str, dict]) -> Tuple[bool, List[str]]:
@@ -141,12 +148,13 @@ def _replace_mcp_servers(servers: Dict[str, dict]) -> Tuple[bool, List[str]]:
     if issues:
         return False, issues
 
-    config = load_config()
-    if servers:
-        config["mcp_servers"] = dict(servers)
-    else:
-        config.pop("mcp_servers", None)
-    save_config(config)
+    with MCP_CONFIG_MUTATION_LOCK:
+        config = load_config()
+        if servers:
+            config["mcp_servers"] = dict(servers)
+        else:
+            config.pop("mcp_servers", None)
+        save_config(config)
     return True, []
 
 

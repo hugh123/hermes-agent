@@ -312,6 +312,19 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/v1/capabilities", adapter._handle_capabilities)
     app.router.add_get("/v1/skills", adapter._handle_skills)
     app.router.add_get("/v1/toolsets", adapter._handle_toolsets)
+    app.router.add_get("/api/mcp/servers", adapter._handle_list_mcp_servers)
+    app.router.add_post("/api/mcp/servers", adapter._handle_add_mcp_server)
+    app.router.add_put("/api/mcp/servers", adapter._handle_replace_mcp_servers)
+    app.router.add_delete(
+        "/api/mcp/servers/{name}", adapter._handle_remove_mcp_server
+    )
+    app.router.add_post(
+        "/api/mcp/servers/{name}/test", adapter._handle_test_mcp_server
+    )
+    app.router.add_put(
+        "/api/mcp/servers/{name}/enabled",
+        adapter._handle_set_mcp_server_enabled,
+    )
     app.router.add_post(
         "/api/sessions/{session_id}/attachments",
         adapter._handle_session_attachment_upload,
@@ -1814,6 +1827,105 @@ class TestEndpointAuth:
                 json={"model": "test", "messages": [{"role": "user", "content": "hi"}]},
             )
             assert resp.status == 401
+
+
+class TestMcpManagementEndpoints:
+    def test_route_table_advertises_agent_mcp_management(self):
+        adapter = _make_adapter()
+        routes = {(method, path) for method, path, _handler in adapter._http_route_table()}
+        assert ("GET", "/api/mcp/servers") in routes
+        assert ("POST", "/api/mcp/servers") in routes
+        assert ("PUT", "/api/mcp/servers") in routes
+        assert ("DELETE", "/api/mcp/servers/{name}") in routes
+        assert ("POST", "/api/mcp/servers/{name}/test") in routes
+        assert ("PUT", "/api/mcp/servers/{name}/enabled") in routes
+
+    @pytest.mark.asyncio
+    async def test_mcp_list_requires_gateway_api_key(self):
+        app = _create_app(_make_adapter(api_key="sk-gateway-mcp-test-key"))
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/api/mcp/servers")
+
+        assert resp.status == 401
+
+    @pytest.mark.asyncio
+    async def test_list_redacts_environment_values(self, monkeypatch):
+        from hermes_cli import mcp_config
+
+        monkeypatch.setattr(
+            mcp_config,
+            "_get_mcp_servers",
+            lambda: {
+                "private": {
+                    "command": "node",
+                    "args": ["server.js"],
+                    "env": {"API_TOKEN": "sk-sensitive-value-123456"},
+                }
+            },
+        )
+        app = _create_app(_make_adapter())
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/api/mcp/servers")
+            body = await resp.json()
+
+        assert resp.status == 200
+        assert body["servers"][0]["name"] == "private"
+        assert body["servers"][0]["env"]["API_TOKEN"] != "sk-sensitive-value-123456"
+
+    @pytest.mark.asyncio
+    async def test_add_uses_shared_cli_config_path_without_returning_bearer_token(
+        self, monkeypatch
+    ):
+        from hermes_cli import mcp_config
+
+        saved = {}
+        monkeypatch.setattr(mcp_config, "_get_mcp_servers", lambda: {})
+        monkeypatch.setattr(
+            mcp_config,
+            "_save_bearer_auth_token",
+            lambda name, token: {"Authorization": f"Bearer ${{MCP_{name.upper()}_API_KEY}}"},
+        )
+
+        def _save(name, config):
+            saved.update({"name": name, "config": dict(config)})
+            return True
+
+        monkeypatch.setattr(mcp_config, "_save_mcp_server", _save)
+        app = _create_app(_make_adapter())
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/api/mcp/servers",
+                json={
+                    "name": "private",
+                    "url": "https://mcp.example.test/mcp",
+                    "auth": "header",
+                    "bearer_token": "secret-token-should-not-echo",
+                },
+            )
+            body = await resp.json()
+
+        assert resp.status == 201
+        assert saved["name"] == "private"
+        assert "secret-token-should-not-echo" not in repr(saved["config"])
+        assert "secret-token-should-not-echo" not in repr(body)
+        assert body["auth"] == "header"
+
+    @pytest.mark.asyncio
+    async def test_add_rejects_conflicting_transports(self):
+        app = _create_app(_make_adapter())
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/api/mcp/servers",
+                json={
+                    "name": "invalid",
+                    "url": "https://mcp.example.test/mcp",
+                    "command": "node",
+                },
+            )
+            body = await resp.json()
+
+        assert resp.status == 400
+        assert body["error"]["code"] == "invalid_mcp_server"
 
 
 # ---------------------------------------------------------------------------

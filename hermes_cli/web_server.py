@@ -13237,97 +13237,35 @@ def _normalize_mcp_server_create(
     standalone MCP page and the Profile Builder enforce the same
     transport/auth contract.
     """
-    from hermes_cli.mcp_config import (
-        _bearer_auth_headers,
-        _strip_bearer_prefix,
-    )
-    from hermes_cli.mcp_security import validate_mcp_server_entry
-
-    name = (body.name or "").strip()
-    if not name:
-        raise ValueError("Server name is required")
-
-    url = (body.url or "").strip()
-    command = (body.command or "").strip()
-    auth = (body.auth or "none").strip().lower()
     bearer_token = (
         body.bearer_token.get_secret_value()
         if body.bearer_token is not None
         else None
     )
+    from hermes_cli.mcp_management import normalize_mcp_server_create
 
-    if bool(url) == bool(command):
-        raise ValueError("Provide exactly one of URL (HTTP/SSE) or command (stdio)")
-    if auth not in {"none", "header", "oauth"}:
-        raise ValueError(f"Unsupported auth mode: {auth}")
-
-    server_config: Dict[str, Any] = {}
-    if url:
-        if body.args:
-            raise ValueError("Arguments are only supported for stdio MCP servers")
-        if body.env:
-            raise ValueError(
-                "Environment variables are only supported for stdio MCP servers"
-            )
-        if auth == "header":
-            normalized = _strip_bearer_prefix(bearer_token) if bearer_token else ""
-            if not normalized or normalized.lower() == "bearer":
-                raise ValueError("Bearer token is required")
-            server_config["headers"] = _bearer_auth_headers(name)
-        elif body.bearer_token is not None:
-            raise ValueError("Bearer token requires header authentication")
-
-        server_config["url"] = url
-        if auth == "oauth":
-            server_config["auth"] = "oauth"
-    else:
-        if auth != "none" or body.bearer_token is not None:
-            raise ValueError(
-                "HTTP authentication is not supported for stdio MCP servers"
-            )
-        server_config["command"] = command
-        if body.args:
-            server_config["args"] = list(body.args)
-        if body.env:
-            server_config["env"] = dict(body.env)
-
-    issues = validate_mcp_server_entry(name, server_config)
-    if issues:
-        raise ValueError(f"Server '{name}' rejected: {'; '.join(issues)}")
-    return name, server_config, bearer_token
+    return normalize_mcp_server_create({
+        "name": body.name,
+        "url": body.url,
+        "command": body.command,
+        "args": body.args,
+        "env": body.env,
+        "auth": body.auth,
+        "bearer_token": bearer_token,
+    })
 
 
 def _redact_mcp_env(env: Dict[str, Any]) -> Dict[str, str]:
     """Mask secret-shaped MCP env values for read responses."""
-    out: Dict[str, str] = {}
-    for k, v in (env or {}).items():
-        try:
-            out[str(k)] = redact_key(str(v)) if v else ""
-        except Exception:
-            out[str(k)] = "***"
-    return out
+    from hermes_cli.mcp_management import redact_mcp_env
+
+    return redact_mcp_env(env)
 
 
 def _mcp_server_summary(name: str, cfg: Dict[str, Any]) -> Dict[str, Any]:
-    transport = "http" if cfg.get("url") else ("stdio" if cfg.get("command") else "unknown")
-    auth = cfg.get("auth")
-    headers = cfg.get("headers") or {}
-    if not auth and isinstance(headers, dict) and any(
-        str(key).lower() == "authorization" for key in headers
-    ):
-        auth = "header"
-    return {
-        "name": name,
-        "transport": transport,
-        "url": cfg.get("url"),
-        "command": cfg.get("command"),
-        "args": list(cfg.get("args") or []),
-        "env": _redact_mcp_env(cfg.get("env") or {}),
-        "auth": auth,
-        "enabled": cfg.get("enabled", True) is not False,
-        # Tool selection: list of enabled tool names, or None = all.
-        "tools": cfg.get("tools"),
-    }
+    from hermes_cli.mcp_management import mcp_server_summary
+
+    return mcp_server_summary(name, cfg)
 
 
 from hermes_cli.web_routers import mcp as _mcp_routes  # noqa: E402

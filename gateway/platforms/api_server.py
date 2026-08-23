@@ -8,6 +8,10 @@ Exposes an HTTP server with endpoints:
 - DELETE /v1/responses/{response_id} — Delete a stored response
 - GET  /v1/models                  — lists hermes-agent and any configured model_routes aliases
 - GET  /v1/capabilities            — machine-readable API capabilities for external UIs
+- GET/POST/PUT /api/mcp/servers    — Agent-level MCP server configuration
+- DELETE /api/mcp/servers/{name}    — remove an Agent-level MCP server
+- POST /api/mcp/servers/{name}/test — probe one MCP server
+- PUT  /api/mcp/servers/{name}/enabled — enable/disable one MCP server
 - GET  /api/sessions               — list client-visible Hermes sessions
 - POST /api/sessions               — create an empty Hermes session
 - GET/PATCH/DELETE /api/sessions/{session_id} — read/update/delete a session
@@ -2204,6 +2208,12 @@ class APIServerAdapter(BasePlatformAdapter):
             ("GET", "/v1/artifacts/download/{artifact_id}", self._handle_artifact_download),
             ("GET", "/v1/skills", self._handle_skills),
             ("GET", "/v1/toolsets", self._handle_toolsets),
+            ("GET", "/api/mcp/servers", self._handle_list_mcp_servers),
+            ("POST", "/api/mcp/servers", self._handle_add_mcp_server),
+            ("PUT", "/api/mcp/servers", self._handle_replace_mcp_servers),
+            ("DELETE", "/api/mcp/servers/{name}", self._handle_remove_mcp_server),
+            ("POST", "/api/mcp/servers/{name}/test", self._handle_test_mcp_server),
+            ("PUT", "/api/mcp/servers/{name}/enabled", self._handle_set_mcp_server_enabled),
             ("GET", "/api/sessions", self._handle_list_sessions),
             ("POST", "/api/sessions", self._handle_create_session),
             ("GET", "/api/sessions/{session_id}", self._handle_get_session),
@@ -3332,6 +3342,341 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=500,
             )
 
+    # ------------------------------------------------------------------
+    # /api/mcp/servers — Agent-level MCP configuration
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _mcp_profile_name() -> Optional[str]:
+        """Return the profile selected by the API multiplex middleware."""
+        return _api_request_profile.get()
+
+    async def _handle_list_mcp_servers(self, request: "web.Request") -> "web.Response":
+        """GET /api/mcp/servers — list the current Agent's MCP servers."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        def _read() -> List[Dict[str, Any]]:
+            from hermes_cli.mcp_config import _get_mcp_servers
+            from hermes_cli.mcp_management import mcp_server_summary
+
+            profile = self._mcp_profile_name()
+            with self._profile_scope(profile):
+                servers = _get_mcp_servers()
+            return [
+                mcp_server_summary(name, cfg)
+                for name, cfg in sorted(servers.items())
+            ]
+
+        try:
+            servers = await asyncio.to_thread(_read)
+        except Exception:
+            logger.exception("[%s] GET /api/mcp/servers failed", self.name)
+            return web.json_response(
+                _openai_error(
+                    "Failed to list MCP servers.",
+                    code="mcp_list_failed",
+                ),
+                status=500,
+            )
+        return web.json_response({"servers": servers})
+
+    async def _handle_add_mcp_server(self, request: "web.Request") -> "web.Response":
+        """POST /api/mcp/servers — add one Agent-level MCP server."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        body, err = await self._read_json_body(request)
+        if err:
+            return err
+
+        try:
+            from hermes_cli.mcp_management import normalize_mcp_server_create
+
+            name, server_config, bearer_token = normalize_mcp_server_create(body)
+        except ValueError as exc:
+            return web.json_response(
+                _openai_error(str(exc), code="invalid_mcp_server"),
+                status=400,
+            )
+
+        def _write() -> Dict[str, Any]:
+            from hermes_cli.mcp_config import (
+                MCP_CONFIG_MUTATION_LOCK,
+                _get_mcp_servers,
+                _save_bearer_auth_token,
+                _save_mcp_server,
+            )
+            from hermes_cli.mcp_management import mcp_server_summary
+
+            profile = self._mcp_profile_name()
+            with self._profile_scope(profile):
+                with MCP_CONFIG_MUTATION_LOCK:
+                    if name in _get_mcp_servers():
+                        raise FileExistsError(name)
+                    if bearer_token is not None:
+                        server_config["headers"] = _save_bearer_auth_token(
+                            name, bearer_token
+                        )
+                    if not _save_mcp_server(name, server_config):
+                        raise ValueError(
+                            f"Server '{name}' rejected: suspicious command/args configuration"
+                        )
+                    return mcp_server_summary(name, server_config)
+
+        try:
+            summary = await asyncio.to_thread(_write)
+        except FileExistsError:
+            return web.json_response(
+                _openai_error(
+                    f"Server '{name}' already exists",
+                    code="mcp_server_exists",
+                ),
+                status=409,
+            )
+        except ValueError as exc:
+            return web.json_response(
+                _openai_error(str(exc), code="invalid_mcp_server"),
+                status=400,
+            )
+        except Exception:
+            logger.exception("[%s] POST /api/mcp/servers failed", self.name)
+            return web.json_response(
+                _openai_error("Failed to save MCP server.", code="mcp_save_failed"),
+                status=500,
+            )
+        return web.json_response(summary, status=201)
+
+    async def _handle_replace_mcp_servers(self, request: "web.Request") -> "web.Response":
+        """PUT /api/mcp/servers — replace the complete MCP server map."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        body, err = await self._read_json_body(request)
+        if err:
+            return err
+        servers = body.get("servers")
+        if not isinstance(servers, dict) or not all(
+            isinstance(name, str) and isinstance(cfg, dict)
+            for name, cfg in servers.items()
+        ):
+            return web.json_response(
+                _openai_error(
+                    "servers must be an object of server configuration objects",
+                    code="invalid_mcp_servers",
+                ),
+                status=400,
+            )
+
+        def _replace() -> tuple[bool, List[str]]:
+            from hermes_cli.mcp_config import (
+                MCP_CONFIG_MUTATION_LOCK,
+                _replace_mcp_servers,
+            )
+
+            profile = self._mcp_profile_name()
+            with self._profile_scope(profile):
+                with MCP_CONFIG_MUTATION_LOCK:
+                    return _replace_mcp_servers(servers)
+
+        try:
+            ok, issues = await asyncio.to_thread(_replace)
+        except Exception:
+            logger.exception("[%s] PUT /api/mcp/servers failed", self.name)
+            return web.json_response(
+                _openai_error("Failed to replace MCP servers.", code="mcp_replace_failed"),
+                status=500,
+            )
+        if not ok:
+            return web.json_response(
+                _openai_error("; ".join(issues), code="invalid_mcp_servers"),
+                status=400,
+            )
+        return web.json_response({"ok": True})
+
+    async def _handle_remove_mcp_server(self, request: "web.Request") -> "web.Response":
+        """DELETE /api/mcp/servers/{name} — remove one MCP server."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        name = str(request.match_info.get("name") or "").strip()
+        if not name:
+            return web.json_response(
+                _openai_error("Server name is required", code="invalid_mcp_server"),
+                status=400,
+            )
+
+        def _remove() -> bool:
+            from hermes_cli.mcp_config import (
+                MCP_CONFIG_MUTATION_LOCK,
+                _remove_mcp_server,
+            )
+
+            profile = self._mcp_profile_name()
+            with self._profile_scope(profile):
+                with MCP_CONFIG_MUTATION_LOCK:
+                    return _remove_mcp_server(name)
+
+        try:
+            removed = await asyncio.to_thread(_remove)
+        except Exception:
+            logger.exception("[%s] DELETE /api/mcp/servers/%s failed", self.name, name)
+            return web.json_response(
+                _openai_error("Failed to remove MCP server.", code="mcp_remove_failed"),
+                status=500,
+            )
+        if not removed:
+            return web.json_response(
+                _openai_error(
+                    f"Server '{name}' not found",
+                    code="mcp_server_not_found",
+                ),
+                status=404,
+            )
+        return web.json_response({"ok": True})
+
+    async def _handle_test_mcp_server(self, request: "web.Request") -> "web.Response":
+        """POST /api/mcp/servers/{name}/test — probe tools and capabilities."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        name = str(request.match_info.get("name") or "").strip()
+
+        def _read() -> Optional[dict]:
+            from hermes_cli.mcp_config import _get_mcp_servers
+
+            profile = self._mcp_profile_name()
+            with self._profile_scope(profile):
+                return _get_mcp_servers().get(name)
+
+        try:
+            server_config = await asyncio.to_thread(_read)
+        except Exception:
+            logger.exception("[%s] GET MCP server config failed", self.name)
+            return web.json_response(
+                _openai_error("Failed to read MCP server.", code="mcp_read_failed"),
+                status=500,
+            )
+        if not isinstance(server_config, dict):
+            return web.json_response(
+                _openai_error(
+                    f"Server '{name}' not found",
+                    code="mcp_server_not_found",
+                ),
+                status=404,
+            )
+
+        details: Dict[str, Any] = {}
+        needs_oauth_token = server_config.get("auth") == "oauth"
+
+        def _probe() -> tuple[List[tuple[str, str]], bool]:
+            from hermes_cli.mcp_config import (
+                _oauth_tokens_present,
+                _probe_single_server,
+            )
+
+            profile = self._mcp_profile_name()
+            with self._profile_scope(profile):
+                tools = _probe_single_server(name, server_config, details=details)
+                token_present = (
+                    _oauth_tokens_present(name) if needs_oauth_token else True
+                )
+                return tools, token_present
+
+        try:
+            tools, token_present = await asyncio.to_thread(_probe)
+        except Exception as exc:
+            return web.json_response({
+                "ok": False,
+                "error": _redact_api_error_text(exc),
+                "tools": [],
+            })
+        if not token_present:
+            return web.json_response({
+                "ok": False,
+                "error": "OAuth authentication required — no token found.",
+                "tools": [],
+            })
+
+        schema_chars = details.get("schema_chars") or {}
+        return web.json_response({
+            "ok": True,
+            "tools": [
+                {
+                    "name": tool_name,
+                    "description": description,
+                    **(
+                        {"schema_chars": schema_chars[tool_name]}
+                        if isinstance(schema_chars.get(tool_name), int)
+                        else {}
+                    ),
+                }
+                for tool_name, description in tools
+            ],
+            "prompts": details.get("prompts", 0),
+            "resources": details.get("resources", 0),
+        })
+
+    async def _handle_set_mcp_server_enabled(
+        self,
+        request: "web.Request",
+    ) -> "web.Response":
+        """PUT /api/mcp/servers/{name}/enabled — toggle one MCP server."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        name = str(request.match_info.get("name") or "").strip()
+        body, err = await self._read_json_body(request)
+        if err:
+            return err
+        if not isinstance(body.get("enabled"), bool):
+            return web.json_response(
+                _openai_error("enabled must be a boolean", code="invalid_mcp_server"),
+                status=400,
+            )
+
+        enabled = body["enabled"]
+
+        def _set_enabled() -> None:
+            from hermes_cli.config import load_config, save_config
+            from hermes_cli.mcp_config import MCP_CONFIG_MUTATION_LOCK
+
+            profile = self._mcp_profile_name()
+            with self._profile_scope(profile):
+                with MCP_CONFIG_MUTATION_LOCK:
+                    config = load_config()
+                    servers = config.get("mcp_servers")
+                    if not isinstance(servers, dict) or name not in servers:
+                        raise KeyError(name)
+                    if not isinstance(servers[name], dict):
+                        raise TypeError("Malformed server config")
+                    servers[name]["enabled"] = enabled
+                    save_config(config)
+
+        try:
+            await asyncio.to_thread(_set_enabled)
+        except KeyError:
+            return web.json_response(
+                _openai_error(
+                    f"Server '{name}' not found",
+                    code="mcp_server_not_found",
+                ),
+                status=404,
+            )
+        except TypeError as exc:
+            return web.json_response(
+                _openai_error(str(exc), code="invalid_mcp_server"),
+                status=400,
+            )
+        except Exception:
+            logger.exception("[%s] PUT MCP enabled failed", self.name)
+            return web.json_response(
+                _openai_error("Failed to update MCP server.", code="mcp_update_failed"),
+                status=500,
+            )
+        return web.json_response({"ok": True, "name": name, "enabled": enabled})
+
     async def _handle_capabilities(self, request: "web.Request") -> "web.Response":
         """GET /v1/capabilities — advertise the stable API surface.
 
@@ -3381,6 +3726,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_attachment_upload": True,
                 "session_fork": True,
                 "session_model_lock": True,
+                "mcp_management": True,
                 "admin_config_rw": False,
                 "jobs_admin": False,
                 "memory_write_api": False,
@@ -3432,6 +3778,21 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_stop": {"method": "POST", "path": "/v1/runs/{run_id}/stop"},
                 "skills": {"method": "GET", "path": "/v1/skills"},
                 "toolsets": {"method": "GET", "path": "/v1/toolsets"},
+                "mcp_servers": {"method": "GET", "path": "/api/mcp/servers"},
+                "mcp_server_create": {"method": "POST", "path": "/api/mcp/servers"},
+                "mcp_servers_replace": {"method": "PUT", "path": "/api/mcp/servers"},
+                "mcp_server_delete": {
+                    "method": "DELETE",
+                    "path": "/api/mcp/servers/{name}",
+                },
+                "mcp_server_test": {
+                    "method": "POST",
+                    "path": "/api/mcp/servers/{name}/test",
+                },
+                "mcp_server_enabled": {
+                    "method": "PUT",
+                    "path": "/api/mcp/servers/{name}/enabled",
+                },
                 "sessions": {"method": "GET", "path": "/api/sessions"},
                 "session_create": {"method": "POST", "path": "/api/sessions"},
                 "session": {"method": "GET", "path": "/api/sessions/{session_id}"},
