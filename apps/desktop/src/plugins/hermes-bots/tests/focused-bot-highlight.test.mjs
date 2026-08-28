@@ -58,17 +58,17 @@ test('BotRow keys the highlight off the focused profile, not the socket home', (
   const row = source.slice(rowStart, rowStart + 2000)
 
   assert.match(row, /const focusedOwner = focusedRosterOwner\(useValue\(\$focusedBotOwner\)\)/)
-  assert.match(row, /const isActive = !activeGroup && isActiveRosterBot\(bot, focusedOwner\)/)
+  assert.match(row, /const isActive = botRowOwnsWorkspace\([\s\S]*?focusedOwner,[\s\S]*?selectedRosterKey/)
 })
 
 test('BotRow keeps turn-busy (work mood) a socket fact', () => {
   const rowStart = source.indexOf('function BotRow(')
-  const row = source.slice(rowStart, rowStart + 3000)
+  const row = source.slice(rowStart, rowStart + 5000)
 
   // Only the gateway-home profile can actually be mid-turn: the mood must NOT
   // switch to the focus-keyed identity.
   assert.match(row, /const isGatewayHome = !bot\.remoteSource && bot\.name === activeProfile/)
-  assert.match(row, /const botMood = \(isGatewayHome && gatewayState === 'busy'\) \|\| activeNow \? 'work' : 'idle'/)
+  assert.match(row, /const botMood = workerActive \|\| \(isGatewayHome && gatewayState === 'busy'\) \? 'work' : 'idle'/)
 })
 
 test('RoutinesPane scopes the Cronjobs tile to the focused chat owner', () => {
@@ -77,7 +77,12 @@ test('RoutinesPane scopes the Cronjobs tile to the focused chat owner', () => {
   const pane = source.slice(paneStart, paneStart + 1200)
 
   assert.match(pane, /const focusedOwner = focusedRosterOwner\(useValue\(\$focusedBotOwner\)\)/)
-  assert.match(pane, /const owner = resolveRoutineOwner\(\$lastRoster\.get\(\), focusedOwner, selected\)/)
+  // The roster read must be a SUBSCRIPTION, not a bare .get(): BotsHomeView
+  // owns the fetch and can hydrate after this pane mounted, so a bare snapshot
+  // pinned the tile on "unavailable" forever (#94483). Scoping intent is
+  // unchanged — it still keys off the focused owner, never the socket-home
+  // profile atom asserted against below.
+  assert.match(pane, /const owner = resolveRoutineOwner\(useValue\(\$lastRoster\), focusedOwner, selected\)/)
   assert.ok(!/useValue\(host\.state\.profile\)/.test(pane), 'the tile must not read the socket-home atom directly')
 })
 
