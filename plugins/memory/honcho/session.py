@@ -919,19 +919,31 @@ class HonchoSessionManager:
             level = self._default_reasoning_level()
 
         def _chat_once() -> str:
+            # Keep dialectic reasoning inside the current Honcho Session.
+            # Peer.chat() without a session argument can reason over the
+            # peer's broader cross-session context, which is not allowed for
+            # chat-content isolation. The user peer's profile/card remains
+            # shared separately through peer.context()/peer.get_card().
+            session_obj = self._sdk_session(session.honcho_session_id)
             if self._ai_observe_others:
                 # AI peer can observe other peers — use assistant as observer.
                 ai_peer_obj = self._get_or_create_peer(session.assistant_peer_id)
                 if target_peer_id == session.assistant_peer_id:
-                    return ai_peer_obj.chat(query, reasoning_level=level) or ""
+                    return ai_peer_obj.chat(
+                        query, session=session_obj, reasoning_level=level
+                    ) or ""
                 return ai_peer_obj.chat(
                     query,
                     target=target_peer_id,
+                    session=session_obj,
                     reasoning_level=level,
                 ) or ""
-            # Without cross-observation, each peer queries its own context.
+            # Without cross-observation, each peer queries its own context,
+            # still bounded to the current session.
             target_peer = self._get_or_create_peer(target_peer_id)
-            return target_peer.chat(query, reasoning_level=level) or ""
+            return target_peer.chat(
+                query, session=session_obj, reasoning_level=level
+            ) or ""
 
         try:
             result = self._authed_call("dialectic query", _chat_once)
@@ -1470,9 +1482,10 @@ class HonchoSessionManager:
         peer: str = "user",
     ) -> str:
         """
-        Search raw messages across every session visible from the target
-        peer's perspective. Results include all authors and require no LLM
-        synthesis.
+        Search raw messages in the current Honcho session only. User-level
+        profile/card retrieval remains shared across sessions, but raw chat
+        search must not leak messages from another session. Results include
+        all authors in this session and require no LLM synthesis.
 
         Args:
             session_key: Session whose workspace/peer scope to search within.
@@ -1492,8 +1505,11 @@ class HonchoSessionManager:
         if not session:
             return ""
 
-        # peer_perspective spans the target peer's sessions across all authors.
+        # Resolve the requested peer for compatibility with the tool API.
+        # The session-scoped search below intentionally does not search all
+        # sessions visible from this peer's perspective.
         peer_id = self._resolve_peer_id(session, peer)
+        honcho_session_id = session.honcho_session_id
 
         # Honcho caps query length for the embedding model; keep well under it.
         q = (query or "").strip()
@@ -1507,29 +1523,37 @@ class HonchoSessionManager:
         limit = max(3, min(20, char_budget // 300))
 
         try:
+            # Honcho's Session.search() is the canonical session-bounded
+            # search API. It returns messages only from this session.
             messages = self._authed_call(
-                "message search",
-                lambda: self.honcho.search(
-                    q,
-                    filters={"peer_perspective": peer_id},
-                    limit=limit,
+                "session message search",
+                lambda: self._sdk_session(honcho_session_id).search(
+                    q, limit=limit
                 ),
             )
         except HonchoAuthError:
             raise
         except Exception as e:
-            logger.debug("Honcho message search failed (peer_perspective=%s): %s", peer_id, e)
-            # Fall back to peer-authored search if the perspective filter is
-            # unsupported by the running Honcho version.
+            logger.debug(
+                "Honcho session search failed (session_id=%s, peer=%s): %s",
+                honcho_session_id, peer_id, e,
+            )
+            # Compatibility fallback for a backend where Session.search() is
+            # unavailable: retain the session_id filter and never fall back to
+            # peer.search(), because peer.search() is cross-session.
             try:
                 messages = self._authed_call(
-                    "peer search",
-                    lambda: self._get_or_create_peer(peer_id).search(q, limit=limit),
+                    "scoped message search",
+                    lambda: self.honcho.search(
+                        q,
+                        filters={"session_id": honcho_session_id},
+                        limit=limit,
+                    ),
                 )
             except HonchoAuthError:
                 raise
             except Exception as e2:
-                logger.debug("Honcho peer search fallback also failed: %s", e2)
+                logger.debug("Honcho scoped message search fallback failed: %s", e2)
                 return ""
 
         if not messages:
