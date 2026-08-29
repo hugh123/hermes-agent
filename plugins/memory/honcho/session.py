@@ -874,8 +874,10 @@ class HonchoSessionManager:
         """
         Query Honcho's dialectic endpoint about a peer.
 
-        Runs an LLM on Honcho's backend against the target peer's full
-        representation. Higher latency than context() — callers run this in
+        Runs an LLM on Honcho's backend against the target peer's
+        representation as seen from the current session — the query is
+        session-scoped so raw messages from the peer's other sessions stay
+        out of reach. Higher latency than context() — callers run this in
         a background thread (see HonchoMemoryProvider) to avoid blocking.
 
         Args:
@@ -918,13 +920,15 @@ class HonchoSessionManager:
         else:
             level = self._default_reasoning_level()
 
+        # Keep dialectic reasoning inside the current Honcho Session.
+        # Peer.chat() without a session argument can reason over the peer's
+        # broader cross-session context, which is not allowed for chat-content
+        # isolation. The user peer's profile/card remains shared separately
+        # through peer.context()/peer.get_card(). Resolved once here rather
+        # than inside the closure, which _authed_call may retry.
+        session_obj = self._sdk_session(session.honcho_session_id)
+
         def _chat_once() -> str:
-            # Keep dialectic reasoning inside the current Honcho Session.
-            # Peer.chat() without a session argument can reason over the
-            # peer's broader cross-session context, which is not allowed for
-            # chat-content isolation. The user peer's profile/card remains
-            # shared separately through peer.context()/peer.get_card().
-            session_obj = self._sdk_session(session.honcho_session_id)
             if self._ai_observe_others:
                 # AI peer can observe other peers — use assistant as observer.
                 ai_peer_obj = self._get_or_create_peer(session.assistant_peer_id)
@@ -1505,9 +1509,9 @@ class HonchoSessionManager:
         if not session:
             return ""
 
-        # Resolve the requested peer for compatibility with the tool API.
-        # The session-scoped search below intentionally does not search all
-        # sessions visible from this peer's perspective.
+        # Only used for log context: the search below is bounded by session,
+        # not by peer perspective, and intentionally does not reach the other
+        # sessions this peer takes part in.
         peer_id = self._resolve_peer_id(session, peer)
         honcho_session_id = session.honcho_session_id
 
