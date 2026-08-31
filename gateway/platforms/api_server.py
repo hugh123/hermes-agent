@@ -8666,8 +8666,15 @@ class APIServerAdapter(BasePlatformAdapter):
             logger.debug("[api_server] SSE stream error for run %s: %s", run_id, exc)
         finally:
             self._run_stream_subscribers.discard(run_id)
-            self._run_streams.pop(run_id, None)
-            self._run_streams_created.pop(run_id, None)
+            # A client disconnect is only a transport change. Keep the event
+            # queue while the executor is still running so a later client can
+            # attach to the same Run again. The periodic orphan sweep owns
+            # transport TTL cleanup, and terminal runs are cleaned up by that
+            # same path after their retention window.
+            #
+            # Do not remove _run_streams here: doing so makes a reconnect
+            # immediately return 404 even though _run_statuses still reports
+            # the Run as running.
 
         return response
 

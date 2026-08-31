@@ -339,6 +339,43 @@ class TestRunEvents:
                 assert "run.completed" in body
                 assert "Hello!" in body
 
+    @pytest.mark.asyncio
+    async def test_disconnect_keeps_live_run_stream_for_reconnect(self, adapter):
+        """A disconnected client must not make an active run unsubscribable."""
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent, agent_ready, _ = _make_slow_agent()
+                mock_create.return_value = mock_agent
+
+                start_resp = await cli.post("/v1/runs", json={"input": "hello"})
+                assert start_resp.status == 202
+                run_id = (await start_resp.json())["run_id"]
+                assert agent_ready.wait(timeout=3.0)
+
+                first_events = await cli.get(f"/v1/runs/{run_id}/events")
+                assert first_events.status == 200
+
+                # Closing only the HTTP transport must not dispose of the
+                # queue: the executor-backed run is still active and can be
+                # attached to again.
+                first_events.close()
+                for _ in range(50):
+                    if run_id not in adapter._run_stream_subscribers:
+                        break
+                    await asyncio.sleep(0.02)
+
+                assert run_id not in adapter._run_stream_subscribers
+                assert run_id in adapter._run_streams
+
+                second_events = await cli.get(f"/v1/runs/{run_id}/events")
+                assert second_events.status == 200
+
+                stop_resp = await cli.post(f"/v1/runs/{run_id}/stop")
+                assert stop_resp.status == 200
+                body = await second_events.text()
+                assert "run.cancelled" in body
+
 
     @pytest.mark.asyncio
     async def test_approval_resolve_all_is_scoped_to_target_run(self, auth_adapter):
