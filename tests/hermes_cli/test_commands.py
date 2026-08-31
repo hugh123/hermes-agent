@@ -19,8 +19,10 @@ from hermes_cli.commands import (
     _clamp_command_names,
     _clamp_telegram_names,
     _sanitize_telegram_name,
+    command_desktop_meta,
     discord_skill_commands,
     gateway_help_lines,
+    infer_argument_mode,
     resolve_command,
     slack_app_manifest,
     slack_native_slashes,
@@ -72,8 +74,29 @@ class TestCommandRegistry:
                     assert resolve_command(alias).name == cmd.name or alias == cmd.name, \
                         f"Alias '{alias}' of '{cmd.name}' shadows canonical '{target.name}'"
 
+    def test_desktop_meta_lives_on_the_command_def(self):
+        review = resolve_command("review")
+        assert review is not None
+        assert review.argument_mode is None
+        assert infer_argument_mode(review) == "text"
+        assert command_desktop_meta(review) == {"argument_mode": "text", "desktop": None}
 
+        clear = resolve_command("clear")
+        assert clear is not None
+        assert clear.desktop == "terminal"
 
+        model = resolve_command("model")
+        assert model is not None
+        assert model.desktop == "hidden"
+
+        goal = resolve_command("goal")
+        assert goal is not None
+        assert goal.argument_mode == "mixed"
+
+    def test_argument_mode_infers_text_from_any_args_hint(self):
+        assert infer_argument_mode(CommandDef("demo", "Demo", "Session", args_hint="<prompt>")) == "text"
+        assert infer_argument_mode(CommandDef("ask", "Ask", "Session", args_hint="<query>")) == "text"
+        assert infer_argument_mode(CommandDef("note", "Note", "Session", args_hint="[message]")) == "text"
 
 
 # ---------------------------------------------------------------------------
@@ -153,11 +176,14 @@ class TestGatewayHelpLines:
                 assert not re.search(pattern, joined), \
                     f"cli_only command /{cmd.name} should not be in gateway help"
 
-    def test_includes_alias_note_for_bg(self):
+    def test_bg_and_btw_are_separate_commands(self):
         lines = gateway_help_lines()
+        joined = "\n".join(lines)
+        assert "`/bg" in joined
+        assert "`/btw" in joined
+        # The retired /background canonical name must be gone.
         bg_line = [l for l in lines if "/background" in l]
-        assert len(bg_line) == 1
-        assert "/bg" in bg_line[0]
+        assert not bg_line
 
 
 class TestTelegramBotCommands:
@@ -175,11 +201,12 @@ class TestTelegramBotCommands:
 
 
     def test_includes_builtin_commands_with_required_args(self):
-        """Built-in arg-taking commands (e.g. /queue, /steer, /background)
+        """Built-in arg-taking commands (e.g. /queue, /steer, /bg, /btw)
         are now included because their handlers return usage text when
         invoked without arguments — issue #24312."""
         names = {name for name, _ in telegram_bot_commands()}
-        assert "background" in names
+        assert "bg" in names
+        assert "btw" in names
         assert "queue" in names
         assert "steer" in names
 
