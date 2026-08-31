@@ -544,10 +544,7 @@ class HonchoMemoryProvider(MemoryProvider):
 
         # Query-aware base retrieval starts with the first substantive message.
         # Generic dialectic prewarm is incompatible with latest-message rewriting.
-        # The dialectic is session-scoped, so a brand-new session has nothing for
-        # it to read: skip the prewarm instead of paying for a backend call that
-        # can only come back empty. The profile still arrives via peer.context().
-        if self._recall_mode in {"context", "hybrid"} and session.messages:
+        if self._recall_mode in {"context", "hybrid"}:
             if self._query_rewriter is None or not self._query_rewrite_enabled:
                 _prewarm_query = (
                     "Summarize what you know about this user. "
