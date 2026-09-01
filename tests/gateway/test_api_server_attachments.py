@@ -31,6 +31,10 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
         "/api/sessions/{session_id}/attachments",
         adapter._handle_session_attachment_upload,
     )
+    app.router.add_post(
+        "/api/sessions/{session_id}/attachments/url",
+        adapter._handle_session_attachment_url_upload,
+    )
     return app
 
 
@@ -131,6 +135,58 @@ async def test_upload_returns_docker_visible_path(tmp_path, monkeypatch):
     host_files = list((hermes_home / "attachments" / "api_server").rglob("contract.pdf"))
     assert len(host_files) == 1
     assert host_files[0].read_bytes() == b"docker payload"
+
+
+@pytest.mark.asyncio
+async def test_url_upload_downloads_server_side_and_returns_same_metadata(tmp_path, monkeypatch):
+    hermes_home = tmp_path / ".hermes"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("TERMINAL_ENV", "local")
+    adapter = _make_adapter()
+    stored_path = hermes_home / "attachments" / "api_server" / "download.pdf"
+    stored = session_attachments.StoredSessionAttachment(
+        target=session_attachments.SessionAttachmentTarget(
+            attachment_id="att_test",
+            session_id="session-1",
+            filename="download.pdf",
+            content_type="application/pdf",
+            host_path=stored_path,
+            agent_path=str(stored_path),
+        ),
+        size=4,
+        sha256=hashlib.sha256(b"data").hexdigest(),
+    )
+    download = AsyncMock(return_value=stored)
+    monkeypatch.setattr(session_attachments, "store_session_attachment_from_url", download)
+
+    async with TestClient(TestServer(_create_app(adapter))) as client:
+        response = await client.post(
+            "/api/sessions/session-1/attachments/url",
+            json={
+                "url": "https://files.example.test/report.pdf",
+                "filename": "download.pdf",
+                "content_type": "application/pdf",
+            },
+        )
+        assert response.status == 201
+        data = await response.json()
+
+    download.assert_awaited_once_with(
+        "session-1",
+        "https://files.example.test/report.pdf",
+        filename="download.pdf",
+        content_type="application/pdf",
+    )
+    assert data == {
+        "object": "hermes.session.attachment",
+        "id": "att_test",
+        "session_id": "session-1",
+        "filename": "download.pdf",
+        "content_type": "application/pdf",
+        "size": 4,
+        "sha256": hashlib.sha256(b"data").hexdigest(),
+        "path": str(stored_path),
+    }
 
 
 @pytest.mark.asyncio

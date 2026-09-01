@@ -17,6 +17,7 @@ Exposes an HTTP server with endpoints:
 - GET/PATCH/DELETE /api/sessions/{session_id} — read/update/delete a session
 - GET  /api/sessions/{session_id}/messages — read session message history
 - POST /api/sessions/{session_id}/attachments — stage a file for the session's agent
+- POST /api/sessions/{session_id}/attachments/url — download and stage a URL for the session's agent
 - POST /api/sessions/{session_id}/fork — branch a session using SessionDB lineage
 - POST /api/sessions/{session_id}/chat[/stream] — chat with a persisted session
 - POST /v1/runs                    — start a run, returns run_id immediately (202)
@@ -2257,6 +2258,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("DELETE", "/api/sessions/{session_id}", self._handle_delete_session),
             ("GET", "/api/sessions/{session_id}/messages", self._handle_session_messages),
             ("POST", "/api/sessions/{session_id}/attachments", self._handle_session_attachment_upload),
+            ("POST", "/api/sessions/{session_id}/attachments/url", self._handle_session_attachment_url_upload),
             ("POST", "/api/sessions/{session_id}/fork", self._handle_fork_session),
             ("POST", "/api/sessions/{session_id}/chat", self._handle_session_chat),
             ("POST", "/api/sessions/{session_id}/chat/stream", self._handle_session_chat_stream),
@@ -3760,6 +3762,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_chat": True,
                 "session_chat_streaming": True,
                 "session_attachment_upload": True,
+                "session_attachment_url_upload": True,
                 "session_fork": True,
                 "session_model_lock": True,
                 "mcp_management": True,
@@ -3839,6 +3842,10 @@ class APIServerAdapter(BasePlatformAdapter):
                     "method": "POST",
                     "path": "/api/sessions/{session_id}/attachments",
                 },
+                "session_attachment_url_upload": {
+                    "method": "POST",
+                    "path": "/api/sessions/{session_id}/attachments/url",
+                },
                 "session_fork": {"method": "POST", "path": "/api/sessions/{session_id}/fork"},
                 "session_chat": {"method": "POST", "path": "/api/sessions/{session_id}/chat"},
                 "session_chat_stream": {"method": "POST", "path": "/api/sessions/{session_id}/chat/stream"},
@@ -3854,6 +3861,8 @@ class APIServerAdapter(BasePlatformAdapter):
             "attachments": {
                 "transport": "multipart/form-data",
                 "form_field": "file",
+                "url_transport": "application/json",
+                "url_field": "url",
                 "message_reference": "path",
                 "max_file_bytes": session_attachments.MAX_SESSION_ATTACHMENT_BYTES,
             },
@@ -5077,6 +5086,92 @@ class APIServerAdapter(BasePlatformAdapter):
                     code="attachment_upload_failed",
                 ),
                 status=500,
+            )
+
+        return web.json_response(
+            {
+                "object": "hermes.session.attachment",
+                "id": stored.target.attachment_id,
+                "session_id": stored.target.session_id,
+                "filename": stored.target.filename,
+                "content_type": stored.target.content_type,
+                "size": stored.size,
+                "sha256": stored.sha256,
+                "path": stored.target.agent_path,
+            },
+            status=201,
+        )
+
+    async def _handle_session_attachment_url_upload(self, request: "web.Request") -> "web.Response":
+        """Download one HTTP(S) URL and stage it for the session agent."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        session_id = request.match_info["session_id"]
+        _, err = await self._get_existing_session_or_404(session_id)
+        if err:
+            return err
+
+        if request.content_type.lower() != "application/json":
+            return web.json_response(
+                _openai_error(
+                    "Content-Type must be application/json",
+                    code="unsupported_media_type",
+                ),
+                status=415,
+            )
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(
+                _openai_error("Invalid JSON", code="invalid_json"),
+                status=400,
+            )
+
+        if not isinstance(body, dict) or not str(body.get("url") or "").strip():
+            return web.json_response(
+                _openai_error("JSON field 'url' is required", code="missing_url"),
+                status=400,
+            )
+
+        try:
+            stored = await session_attachments.store_session_attachment_from_url(
+                session_id,
+                str(body["url"]).strip(),
+                filename=str(body.get("filename") or "").strip() or None,
+                content_type=str(body.get("content_type") or "").strip() or None,
+            )
+        except session_attachments.AttachmentTooLargeError:
+            return web.json_response(
+                _openai_error(
+                    (
+                        "Attachment exceeds the maximum size of "
+                        f"{session_attachments.MAX_SESSION_ATTACHMENT_BYTES} bytes"
+                    ),
+                    code="attachment_too_large",
+                ),
+                status=413,
+            )
+        except session_attachments.EmptyAttachmentError:
+            return web.json_response(
+                _openai_error("Attachment file is empty", code="empty_attachment"),
+                status=400,
+            )
+        except session_attachments.AttachmentUrlError as exc:
+            return web.json_response(
+                _openai_error(str(exc), code="invalid_attachment_url"),
+                status=400,
+            )
+        except Exception:
+            logger.exception("Failed to download attachment for session %s", session_id)
+            return web.json_response(
+                _openai_error(
+                    "Failed to download attachment",
+                    code="attachment_download_failed",
+                ),
+                status=502,
             )
 
         return web.json_response(

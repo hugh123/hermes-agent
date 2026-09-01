@@ -542,11 +542,37 @@ External UIs can manage Hermes sessions over REST without standing up the dashbo
 | `PATCH` | `/api/sessions/{id}` | Update title or `end_reason` |
 | `DELETE` | `/api/sessions/{id}` | Delete a session |
 | `GET` | `/api/sessions/{id}/messages` | Message history for a session |
+| `POST` | `/api/sessions/{id}/attachments` | Upload a multipart file for the session |
+| `POST` | `/api/sessions/{id}/attachments/url` | Download and stage an HTTP(S) URL for the session |
 | `POST` | `/api/sessions/{id}/fork` | Branch the session via `SessionDB` lineage (matches CLI `/branch` semantics) |
 | `POST` | `/api/sessions/{id}/chat` | Run one synchronous agent turn |
 | `POST` | `/api/sessions/{id}/chat/stream` | SSE wrapper over a single turn — emits `assistant.delta`, `tool.started`, `tool.completed`, `run.completed` events |
 
 `/v1/capabilities` advertises the full surface via `session_*` feature flags and `endpoints.session_*` entries so external UIs can detect support and fall back safely. Inline images are supported in `chat` and `chat/stream` payloads (multimodal-aware path).
+
+### POST /api/sessions/{session_id}/attachments/url
+
+Download an attachment from an HTTP(S) URL on the Hermes Gateway host and stage
+it for the specified session. This avoids sending the file bytes through the
+calling service. The URL is fetched with the shared SSRF protection, streamed
+to the same atomic session-attachment storage used by the multipart endpoint,
+and capped at 50 MiB. The endpoint is authenticated by `API_SERVER_KEY` and
+requires the target session to already exist.
+
+```json
+{
+  "url": "https://example.com/report.pdf",
+  "filename": "report.pdf",
+  "content_type": "application/pdf"
+}
+```
+
+Only `url` is required. `filename` and `content_type` are optional; when
+omitted, the filename is derived from the URL path and the content type is
+derived from the remote response or filename. The response shape is the same
+as `POST /api/sessions/{session_id}/attachments`, including the agent-visible
+`path`.
+
 
 ```bash
 # fork a session and run one turn

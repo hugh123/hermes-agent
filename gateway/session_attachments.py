@@ -21,13 +21,15 @@ import uuid
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import unquote
+from urllib.parse import unquote, urljoin, urlparse
 
 from hermes_constants import get_hermes_home
 
 
 MAX_SESSION_ATTACHMENT_BYTES = 50 * 1024 * 1024
 UPLOAD_CHUNK_BYTES = 1024 * 1024
+MAX_ATTACHMENT_URL_REDIRECTS = 5
+ATTACHMENT_URL_TIMEOUT_SECONDS = 30.0
 
 
 class AttachmentUploadError(ValueError):
@@ -40,6 +42,10 @@ class AttachmentTooLargeError(AttachmentUploadError):
 
 class EmptyAttachmentError(AttachmentUploadError):
     """Raised when an upload contains no file bytes."""
+
+
+class AttachmentUrlError(AttachmentUploadError):
+    """Raised when a remote attachment URL cannot be fetched safely."""
 
 
 @dataclass(frozen=True)
@@ -153,6 +159,81 @@ def allocate_session_attachment(
         with suppress(OSError):
             root.rmdir()
         raise
+
+
+def filename_from_attachment_url(url: str) -> str:
+    """Derive a safe fallback filename from an attachment URL."""
+
+    leaf = unquote(urlparse(url).path.rsplit("/", 1)[-1]).strip()
+    return sanitize_attachment_name(leaf or "download")
+
+
+async def store_session_attachment_from_url(
+    session_id: str,
+    url: str,
+    *,
+    filename: str | None = None,
+    content_type: str | None = None,
+) -> StoredSessionAttachment:
+    """Download an HTTP(S) URL and atomically stage it for a session agent.
+
+    Every URL and manually-followed redirect is checked by the shared SSRF
+    policy before the request is made. The response is streamed directly into
+    the existing session attachment writer, so the file is not buffered in
+    memory and uses the same size/atomic-commit rules as multipart uploads.
+    """
+
+    import httpx
+
+    current_url = str(url or "").strip()
+    if not current_url:
+        raise AttachmentUrlError("url is required")
+
+    from tools.url_safety import create_ssrf_safe_async_client, is_safe_url
+
+    async with create_ssrf_safe_async_client(
+        timeout=httpx.Timeout(ATTACHMENT_URL_TIMEOUT_SECONDS),
+        follow_redirects=False,
+        headers={"User-Agent": "hermes-agent/session-attachment"},
+    ) as client:
+        for _ in range(MAX_ATTACHMENT_URL_REDIRECTS + 1):
+            parsed = urlparse(current_url)
+            if parsed.scheme.lower() not in ("http", "https"):
+                raise AttachmentUrlError("only http and https URLs are supported")
+            if not is_safe_url(current_url):
+                raise AttachmentUrlError("URL blocked by SSRF protection")
+
+            async with client.stream("GET", current_url) as response:
+                if response.is_redirect:
+                    location = response.headers.get("location")
+                    if not location:
+                        raise AttachmentUrlError("redirect response has no Location header")
+                    current_url = urljoin(current_url, location)
+                    continue
+
+                response.raise_for_status()
+                content_length = response.headers.get("content-length")
+                if content_length:
+                    try:
+                        content_length_value = int(content_length)
+                    except ValueError:
+                        content_length_value = None
+                    if content_length_value is not None and content_length_value > MAX_SESSION_ATTACHMENT_BYTES:
+                        raise AttachmentTooLargeError(
+                            f"attachment exceeds the maximum size of {MAX_SESSION_ATTACHMENT_BYTES} bytes"
+                        )
+
+                target = allocate_session_attachment(
+                    session_id,
+                    filename or filename_from_attachment_url(current_url),
+                    content_type or response.headers.get("content-type"),
+                )
+                with SessionAttachmentWriter(target) as writer:
+                    async for chunk in response.aiter_bytes(UPLOAD_CHUNK_BYTES):
+                        writer.write(chunk)
+                    return writer.commit()
+
+    raise AttachmentUrlError(f"too many redirects fetching {url}")
 
 
 class SessionAttachmentWriter:
